@@ -1,0 +1,9 @@
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/libxdma.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma_cdev.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/cdev_ctrl.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/cdev_events.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/cdev_sgdma.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/cdev_xvc.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/cdev_bypass.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma_mod.o
+/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma_thread.o

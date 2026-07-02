@@ -1,0 +1,1 @@
+savedcmd_/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma.o := ld -m elf_x86_64 -z noexecstack   -r -o /home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma.o @/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma.mod 

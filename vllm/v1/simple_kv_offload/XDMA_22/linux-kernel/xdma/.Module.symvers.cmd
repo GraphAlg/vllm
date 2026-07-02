@@ -1,0 +1,1 @@
+savedcmd_/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/Module.symvers :=  scripts/mod/modpost -m -a      -o /home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/Module.symvers -T /home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/modules.order -i Module.symvers -e 

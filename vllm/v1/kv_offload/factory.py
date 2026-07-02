@@ -71,3 +71,8 @@ OffloadingSpecFactory.register_spec(
     "vllm.v1.kv_offload.tiering.spec",
     "TieringOffloadingSpec",
 )
+OffloadingSpecFactory.register_spec(
+    "FPGAOffloadingSpec",
+    "vllm.v1.kv_offload.fpga.spec",
+    "FPGAOffloadingSpec",
+)

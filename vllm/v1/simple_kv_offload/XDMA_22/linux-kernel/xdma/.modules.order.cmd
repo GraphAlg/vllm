@@ -1,0 +1,1 @@
+savedcmd_/home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/modules.order := {   echo /home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/xdma.o; :; } > /home/hpy/wrk/project/AI_acc/XDMA_22/linux-kernel/xdma/modules.order
