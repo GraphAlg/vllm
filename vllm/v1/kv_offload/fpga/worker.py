@@ -1,6 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Worker-side handler for FPGA KV cache offloading."""
+"""Worker-side handler for FPGA KV cache offloading.
+
+Supports pluggable DMA backends -- use ``VLLM_FPGA_BACKEND`` to select:
+
+  ``xdma_bounce`` (default)
+      Xilinx XDMA + host bounce buffer.  Requires ``/dev/xdma*`` devices.
+  ``gpu_direct_p2p``
+      GPU DMA controller writes FPGA BAR directly.  Zero bounce buffer.
+      Requires driver to map FPGA BAR into CUDA address space.
+  ``intel_fpga``
+      Intel FPGA DMA (skeleton -- fill in vendor driver calls).
+
+Examples::
+
+    # XDMA (requires real or mock devices):
+    VLLM_FPGA_MOCK=1 python start_with_fpga.py
+
+    # P2P: no XDMA devices needed at all:
+    export VLLM_FPGA_BACKEND=gpu_direct_p2p
+    export VLLM_FPGA_BAR_ADDR=0x...
+    python start_with_fpga.py
+"""
 
 from __future__ import annotations
 
@@ -10,12 +31,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.kv_offload.fpga.allocator import FPGABlockAllocator
-from vllm.v1.kv_offload.fpga.xdma_driver import (
-    MockXDMAHandle,
-    XDMAHandle,
-)
-from vllm.v1.kv_offload.fpga.copy_backend import XDMACopyBackend
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     GPULoadStoreSpec,
@@ -23,22 +38,124 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.fpga.allocator import FPGABlockAllocator
+from vllm.v1.kv_offload.fpga.copy_backend import BlockTransferEngine
 
 if TYPE_CHECKING:
-    pass
+    from vllm.v1.kv_offload.fpga.backends.xdma_bounce_buffer import (
+        XDMABounceBufferBackend,
+    )
 
 logger = init_logger(__name__)
 
-# Default XDMA device prefix (h2c_0 / c2h_0 appended automatically).
-_DEFAULT_XDMA_PREFIX = "/dev/xdma0"
+# Recognised backend types -- extend when adding new backends.
+_BACKEND_XDMA_BOUNCE = "xdma_bounce"
+_BACKEND_GPU_P2P = "gpu_direct_p2p"
+_BACKEND_INTEL = "intel_fpga"
+
+
+def _create_backend_and_allocator(
+    backend_name: str,
+    xdma_prefix: str,
+    fpga_capacity_bytes: int,
+    total_bytes_per_block: int,
+    store_stream: torch.cuda.Stream,
+    load_stream: torch.cuda.Stream,
+) -> tuple:
+    """Factory: create (backend, fpga_allocator) from backend name.
+
+    Only the XDMA path requires ``/dev/xdma*`` devices (or
+    ``VLLM_FPGA_MOCK=1`` for mock).  P2P and Intel backends need
+    no XDMA driver at all.
+    """
+    if backend_name == _BACKEND_XDMA_BOUNCE:
+        # Delayed imports: only pull in XDMA when actually using it.
+        from vllm.v1.kv_offload.fpga.xdma_driver import (
+            MockXDMAHandle,
+            XDMAHandle,
+        )
+        from vllm.v1.kv_offload.fpga.backends.xdma_bounce_buffer import (
+            XDMABounceBufferBackend,
+        )
+
+        use_mock = os.environ.get("VLLM_FPGA_MOCK", "0") == "1"
+        if use_mock:
+            xdma = MockXDMAHandle(ddr_size=fpga_capacity_bytes)
+            logger.info("FPGAWorker: using MockXDMAHandle")
+        else:
+            xdma = XDMAHandle()
+            xdma.open(
+                h2c_device=f"{xdma_prefix}_h2c_0",
+                c2h_device=f"{xdma_prefix}_c2h_0",
+            )
+
+        allocator = FPGABlockAllocator(
+            fpga=xdma,
+            dram_size_bytes=fpga_capacity_bytes,
+            block_size_bytes=total_bytes_per_block,
+        )
+        backend = XDMABounceBufferBackend(
+            fpga=xdma,
+            fpga_allocator=allocator,
+        )
+        return backend, allocator
+
+    if backend_name == _BACKEND_GPU_P2P:
+        from vllm.v1.kv_offload.fpga.backends.gpu_direct_p2p import (
+            GPUDirectP2PBackend,
+        )
+
+        bar_cuda_ptr = int(os.environ.get("VLLM_FPGA_BAR_ADDR", "0"), 16)
+        if bar_cuda_ptr == 0:
+            raise RuntimeError(
+                "GPUDirectP2PBackend requires VLLM_FPGA_BAR_ADDR "
+                "(CUDA virtual address of FPGA BAR). "
+                "Set it via env or import your driver module here."
+            )
+
+        # P2P allocator: no XDMA handle needed, just block management.
+        from vllm.v1.kv_offload.fpga.xdma_driver import MockXDMAHandle
+        allocator = FPGABlockAllocator(
+            fpga=MockXDMAHandle(ddr_size=fpga_capacity_bytes),
+            dram_size_bytes=fpga_capacity_bytes,
+            block_size_bytes=total_bytes_per_block,
+        )
+        backend = GPUDirectP2PBackend(
+            fpga_allocator=allocator,
+            bar_cuda_ptr=bar_cuda_ptr,
+            block_size=total_bytes_per_block,
+            store_stream=store_stream,
+            load_stream=load_stream,
+        )
+        return backend, allocator
+
+    if backend_name == _BACKEND_INTEL:
+        from vllm.v1.kv_offload.fpga.backends.intel_fpga import (
+            IntelFPGAP2PBackend,
+        )
+
+        from vllm.v1.kv_offload.fpga.xdma_driver import MockXDMAHandle
+        allocator = FPGABlockAllocator(
+            fpga=MockXDMAHandle(ddr_size=fpga_capacity_bytes),
+            dram_size_bytes=fpga_capacity_bytes,
+            block_size_bytes=total_bytes_per_block,
+        )
+        backend = IntelFPGAP2PBackend(fpga_allocator=allocator)
+        return backend, allocator
+
+    raise ValueError(
+        f"Unknown FPGA backend '{backend_name}'. "
+        f"Supported: {_BACKEND_XDMA_BOUNCE}, {_BACKEND_GPU_P2P}, "
+        f"{_BACKEND_INTEL}"
+    )
 
 
 class FPGAOffloadingWorker(OffloadingWorker):
     """Worker-side FPGA offload handler.
 
-    Manages GPU→FPGA and FPGA→GPU transfers via XDMA, using a bounce
-    buffer approach (GPU → pinned host → XDMA → FPGA DRAM, and vice
-    versa).
+    Manages GPU→FPGA and FPGA→GPU transfers via a pluggable
+    ``DMABackend``.  Set ``VLLM_FPGA_BACKEND`` to select the transport
+    (default: ``xdma_bounce``).
     """
 
     def __init__(
@@ -47,7 +164,7 @@ class FPGAOffloadingWorker(OffloadingWorker):
         block_size_factor: int,
         num_fpga_blocks: int,
         fpga_capacity_bytes: int,
-        xdma_prefix: str = _DEFAULT_XDMA_PREFIX,
+        xdma_prefix: str = "/dev/xdma0",
     ) -> None:
         self._kv_caches = kv_caches
         self._block_size_factor = block_size_factor
@@ -58,9 +175,9 @@ class FPGAOffloadingWorker(OffloadingWorker):
         # Resolved canonical tensors (int8, (num_blocks, page_size_bytes)).
         self._gpu_tensors: list[torch.Tensor] = []
 
-        # FPGA block allocator + XDMA backend.
+        # FPGA block allocator + transfer engine (vendor agnostic).
         self._fpga_alloc: FPGABlockAllocator | None = None
-        self._backend: XDMACopyBackend | None = None
+        self._engine: BlockTransferEngine | None = None
 
         # Event tracking (mirrors SimpleCPUOffloadWorker pattern).
         self._load_events: list[tuple[int, torch.Event]] = []
@@ -84,9 +201,8 @@ class FPGAOffloadingWorker(OffloadingWorker):
         self._setup()
 
     def _setup(self) -> None:
-        """Initialise FPGA hardware, allocator, and copy backend."""
+        """Initialise FPGA hardware, allocator, and pluggable backend."""
         # Canonical tensors: each has shape (num_blocks, page_size_bytes), int8.
-        # The OffloadingConnectorWorker registers these as the "GPU side".
         gpu_cache_dict: dict[str, torch.Tensor] = {}
         for i, ct in enumerate(self._kv_caches.tensors):
             name = f"tensor_{i}"
@@ -97,45 +213,37 @@ class FPGAOffloadingWorker(OffloadingWorker):
             ct.page_size_bytes for ct in self._kv_caches.tensors
         )
 
-        # FPGA allocator.
-        use_mock = os.environ.get("VLLM_FPGA_MOCK", "0") == "1"
-        if use_mock:
-            xdma = MockXDMAHandle(ddr_size=self._fpga_capacity_bytes)
-            logger.info("FPGAWorker: using MockXDMAHandle")
-        else:
-            xdma = XDMAHandle()
-            xdma.open(
-                h2c_device=f"{self._xdma_prefix}_h2c_0",
-                c2h_device=f"{self._xdma_prefix}_c2h_0",
-            )
+        # Backend selection via env var (default: xdma_bounce).
+        backend_name = os.environ.get(
+            "VLLM_FPGA_BACKEND", _BACKEND_XDMA_BOUNCE,
+        )
 
-        self._fpga_alloc = FPGABlockAllocator(
-            fpga=xdma,
-            dram_size_bytes=self._num_fpga_blocks * total_bytes_per_block,
-            block_size_bytes=total_bytes_per_block,
+        # Create backend + allocator (no XDMA unless backend needs it).
+        backend, self._fpga_alloc = _create_backend_and_allocator(
+            backend_name=backend_name,
+            xdma_prefix=self._xdma_prefix,
+            fpga_capacity_bytes=self._num_fpga_blocks * total_bytes_per_block,
+            total_bytes_per_block=total_bytes_per_block,
+            store_stream=self._store_stream,
+            load_stream=self._load_stream,
         )
 
         # Pre-allocate FPGA blocks.
         self._fpga_alloc.alloc_batch(self._num_fpga_blocks)
         logger.info(
-            "FPGAWorker: %d FPGA blocks reserved (%.2f MiB each)",
+            "FPGAWorker: %d FPGA blocks reserved (%.2f MiB each), backend=%s",
             self._num_fpga_blocks,
             total_bytes_per_block / (1024**2),
+            backend.name,
         )
 
-        # Copy backend.
-        self._backend = XDMACopyBackend(
-            fpga_handle=xdma,
-            fpga_allocator=self._fpga_alloc,
-        )
-        self._backend.init(
+        # Transfer engine.
+        self._engine = BlockTransferEngine(
+            backend=backend,
             gpu_caches=gpu_cache_dict,
-            fpga_caches={},
-            device=gpu_cache_dict["tensor_0"].device,
-            load_stream=self._load_stream,
             store_stream=self._store_stream,
+            load_stream=self._load_stream,
         )
-
         self._gpu_tensors = [ct.tensor for ct in self._kv_caches.tensors]
 
     # -- OffloadingWorker interface ---------------------------------------
@@ -143,16 +251,7 @@ class FPGAOffloadingWorker(OffloadingWorker):
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
     ) -> bool:
-        """Async GPU → FPGA.
-
-        Args:
-            job_id: Unique transfer identifier.
-            src_spec: GPU block IDs (GPULoadStoreSpec).
-            dst_spec: FPGA block IDs (FPGALoadStoreSpec).
-
-        Returns:
-            True if submitted, False on error.
-        """
+        """Async GPU → FPGA."""
         gpu_block_ids: list[int] = src_spec.block_ids.tolist()
         fpga_block_ids: list[int] = dst_spec.block_ids.tolist()
 
@@ -166,11 +265,8 @@ class FPGAOffloadingWorker(OffloadingWorker):
         # Record that compute must finish before store.
         self._store_compute_done.record(torch.cuda.current_stream())
 
-        # Enqueue via copy backend — backend's background thread records
-        # a CUDA event in *events_list* when the copy on the store stream
-        # completes.
-        assert self._backend is not None
-        self._backend.launch_copy(
+        assert self._engine is not None
+        self._engine.launch_copy(
             src_blocks=gpu_block_ids,
             dst_blocks=fpga_block_ids,
             is_store=True,
@@ -178,23 +274,13 @@ class FPGAOffloadingWorker(OffloadingWorker):
             events_list=self._store_events,
             wait_event=self._store_compute_done,
         )
-
         self._pending_store_job_ids.add(job_id)
         return True
 
     def submit_load(
         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec
     ) -> bool:
-        """Async FPGA → GPU.
-
-        Args:
-            job_id: Unique transfer identifier.
-            src_spec: FPGA block IDs (FPGALoadStoreSpec).
-            dst_spec: GPU block IDs (GPULoadStoreSpec).
-
-        Returns:
-            True if submitted, False on error.
-        """
+        """Async FPGA → GPU."""
         fpga_block_ids: list[int] = src_spec.block_ids.tolist()
         gpu_block_ids: list[int] = dst_spec.block_ids.tolist()
 
@@ -205,27 +291,21 @@ class FPGAOffloadingWorker(OffloadingWorker):
             )
             return False
 
-        assert self._backend is not None
-        self._backend.launch_copy(
+        assert self._engine is not None
+        self._engine.launch_copy(
             src_blocks=fpga_block_ids,
             dst_blocks=gpu_block_ids,
             is_store=False,
             event_idx=job_id,
             events_list=self._load_events,
         )
-
         self._pending_load_job_ids.add(job_id)
         return True
 
     def get_finished(self) -> list[TransferResult]:
-        """Return completed transfers since the last call.
-
-        Polls CUDA events recorded by the XDMACopyBackend background
-        thread on each completed block copy.
-        """
+        """Return completed transfers since the last call."""
         results: list[TransferResult] = []
 
-        # Check completed loads.
         if self._pending_load_job_ids:
             load_wm = self._poll_events(is_store=False)
             for jid in list(self._pending_load_job_ids):
@@ -235,7 +315,6 @@ class FPGAOffloadingWorker(OffloadingWorker):
                         job_id=jid, success=True, transfer_size=0,
                     ))
 
-        # Check completed stores.
         if self._pending_store_job_ids:
             store_wm = self._poll_events(is_store=True)
             for jid in list(self._pending_store_job_ids):
@@ -274,5 +353,5 @@ class FPGAOffloadingWorker(OffloadingWorker):
         return hwm
 
     def shutdown(self) -> None:
-        if self._backend is not None:
-            self._backend.shutdown()
+        if self._engine is not None:
+            self._engine.shutdown()
