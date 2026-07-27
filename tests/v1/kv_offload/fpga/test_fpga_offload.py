@@ -382,7 +382,7 @@ class TestFPGAOffloadingSpec:
         """Create FPGAOffloadingSpec programmatically."""
         import transformers
         from vllm.config import VllmConfig, CacheConfig, \
-            ParallelConfig, SchedulerConfig
+            ParallelConfig, SchedulerConfig, DeviceConfig
         from vllm.config.kv_transfer import KVTransferConfig
         from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
      
@@ -391,25 +391,28 @@ class TestFPGAOffloadingSpec:
             cache_config=CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
-                swap_space=0,
+                #swap_space=0,
                 cache_dtype="auto",
                 num_gpu_blocks_override=None,
             ),
+            device_config=DeviceConfig(device="cuda"),
             parallel_config=ParallelConfig(tensor_parallel_size=1),
             scheduler_config=SchedulerConfig(
                 max_num_batched_tokens=4096,
                 max_num_seqs=256,
                 max_model_len=4096,
+                is_encoder_decoder=False,
             ),
             kv_transfer_config=KVTransferConfig(
                 kv_connector="OffloadingConnector",
+                kv_role="kv_both",
                 kv_connector_extra_config={
                     "spec_name": "FPGAOffloadingSpec",
                     "fpga_bytes_to_use": 16 * (1024**3),
                 },
             ),
         )
-        kvc = KVCacheConfig(num_blocks=128, kv_cache_tensors=[],
+        kvc = KVCacheConfig(num_blocks=128, kv_cache_tensors=[KVCacheTensor(size=128*1024*1024,shared_by=[],block_stride=0)],
                             kv_cache_groups=[])
         spec = FPGAOffloadingSpec(config, kvc)
         assert isinstance(spec, FPGAOffloadingSpec)
@@ -418,8 +421,8 @@ class TestFPGAOffloadingSpec:
 
     def test_factory_resolves_fpga_spec(self):
         """OffloadingSpecFactory resolves FPGAOffloadingSpec by name."""
-        from vllm.config import VllmConfig, ModelConfig, CacheConfig, \
-            ParallelConfig, SchedulerConfig
+        from vllm.config import VllmConfig, CacheConfig, \
+            ParallelConfig, SchedulerConfig, DeviceConfig
         from vllm.config.kv_transfer import KVTransferConfig
 
         config = VllmConfig(
@@ -434,18 +437,21 @@ class TestFPGAOffloadingSpec:
             cache_config=CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
-                swap_space=0,
+                #swap_space=0,
                 cache_dtype="auto",
                 num_gpu_blocks_override=None,
             ),
+            device_config=DeviceConfig(device="cuda"),
             parallel_config=ParallelConfig(tensor_parallel_size=1),
             scheduler_config=SchedulerConfig(
                 max_num_batched_tokens=4096,
                 max_num_seqs=256,
                 max_model_len=4096,
+                is_encoder_decoder=False,
             ),
             kv_transfer_config=KVTransferConfig(
                 kv_connector="OffloadingConnector",
+                kv_role="kv_both",
                 kv_connector_extra_config={
                     "spec_name": "FPGAOffloadingSpec",
                 },
