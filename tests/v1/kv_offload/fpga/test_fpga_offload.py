@@ -24,7 +24,10 @@ from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.fpga.allocator import FPGABlockAllocator
 from vllm.v1.kv_offload.fpga.xdma_driver import MockXDMAHandle
-from vllm.v1.kv_offload.fpga.copy_backend import XDMACopyBackend
+from vllm.v1.kv_offload.fpga.backends.xdma_bounce_buffer import (
+    XDMABounceBufferBackend,
+)
+from vllm.v1.kv_offload.fpga.copy_backend import BlockTransferEngine
 from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
@@ -75,7 +78,7 @@ class TestFPGABlockAllocator:
 
     def test_oom(self, allocator):
         n = allocator.num_blocks
-        with pytest.raises(RuntimeError, match="out of memory"):
+        with pytest.raises(RuntimeError, match="out of memory|need.*blocks.*only.*free"):
             allocator.alloc_batch(n + 1)
 
     def test_block_offset(self, allocator):
@@ -122,48 +125,52 @@ class TestMockXDMA:
 
 
 # ===========================================================================
-# 层级 2: XDMACopyBackend GPU↔FPGA 圆整测试（需要 CUDA）
+# 层级 2: BlockTransferEngine + XDMABounceBufferBackend GPU↔FPGA 圆整测试（需要 CUDA）
 # ===========================================================================
 
 
-class TestXDMACopyBackend:
+class TestBlockTransferEngine:
     NUM_BLOCKS = 8
     BLOCK_SIZE = 2 * 1024 * 1024  # 2 MiB
     DRAM_SIZE = NUM_BLOCKS * BLOCK_SIZE
 
     @pytest.fixture
-    def setup(self):
+    def engine(self):
         if not torch.cuda.is_available():
             pytest.skip("CUDA not available")
 
         mock = MockXDMAHandle(self.DRAM_SIZE)
         alloc = FPGABlockAllocator(mock, self.DRAM_SIZE, self.BLOCK_SIZE)
-        block_ids = alloc.alloc_batch(self.NUM_BLOCKS)
+        alloc.alloc_batch(self.NUM_BLOCKS)
 
         gpu = {
             "layer_0":
                 torch.randn(self.NUM_BLOCKS, self.BLOCK_SIZE // 4,
                             dtype=torch.float32).cuda(),
         }
-        return {
+
+        backend = XDMABounceBufferBackend(fpga=mock, fpga_allocator=alloc)
+        eng = BlockTransferEngine(
+            backend=backend,
+            gpu_caches=gpu,
+            store_stream=torch.cuda.Stream(),
+            load_stream=torch.cuda.Stream(),
+        )
+        yield {
+            "engine": eng,
             "fpga": mock,
             "alloc": alloc,
-            "fpga_block_ids": block_ids,
+            "fpga_block_ids": list(range(self.NUM_BLOCKS)),
             "gpu_caches": gpu,
-            "device": "cuda:0",
         }
+        eng.shutdown()
 
-    def test_store_then_load_roundtrip(self, setup):
+    def test_store_then_load_roundtrip(self, engine):
         """GPU → FPGA → GPU: data should survive the trip."""
-        gpu = setup["gpu_caches"]
-        alloc = setup["alloc"]
-        mock_fpga = setup["fpga"]
-        fpga_bids = setup["fpga_block_ids"]
-
-        backend = XDMACopyBackend(mock_fpga, alloc)
-        ls = torch.cuda.Stream()
-        ss = torch.cuda.Stream()
-        backend.init(gpu, {}, setup["device"], ls, ss)
+        gpu = engine["gpu_caches"]
+        alloc = engine["alloc"]
+        eng = engine["engine"]
+        fpga_bids = engine["fpga_block_ids"]
 
         # Save original; poison GPU block.
         ref = gpu["layer_0"][0].clone()
@@ -171,37 +178,32 @@ class TestXDMACopyBackend:
 
         # Store GPU[0] → FPGA[id[0]]
         ev: list = []
-        backend.launch_copy([0], [fpga_bids[0]], True, 0, ev, None)
+        eng.launch_copy([0], [fpga_bids[0]], True, 0, ev, None)
         for _, e in ev:
             e.synchronize()
         ev.clear()
 
         # Load FPGA[id[0]] → GPU[1]
-        backend.launch_copy([fpga_bids[0]], [1], False, 1, ev)
+        eng.launch_copy([fpga_bids[0]], [1], False, 1, ev)
         for _, e in ev:
             e.synchronize()
 
         assert torch.allclose(gpu["layer_0"][1].cpu(), ref.cpu(), atol=1e-5)
-        backend.shutdown()
 
-    def test_multiple_blocks(self, setup):
+    def test_multiple_blocks(self, engine):
         """Batch store multiple blocks and verify via FPGA readback."""
-        gpu = setup["gpu_caches"]
-        alloc = setup["alloc"]
-        mock_fpga = setup["fpga"]
-        fpga_bids = setup["fpga_block_ids"]
-
-        backend = XDMACopyBackend(mock_fpga, alloc)
-        ls = torch.cuda.Stream()
-        ss = torch.cuda.Stream()
-        backend.init(gpu, {}, setup["device"], ls, ss)
+        gpu = engine["gpu_caches"]
+        alloc = engine["alloc"]
+        mock_fpga = engine["fpga"]
+        eng = engine["engine"]
+        fpga_bids = engine["fpga_block_ids"]
 
         import ctypes
         gpu_t = gpu["layer_0"]
         block_bytes = gpu_t[0].numel() * gpu_t[0].element_size()
 
         ev: list = []
-        backend.launch_copy([0, 1], [fpga_bids[0], fpga_bids[1]], True, 0, ev, None)
+        eng.launch_copy([0, 1], [fpga_bids[0], fpga_bids[1]], True, 0, ev, None)
         for _, e in ev:
             e.synchronize()
 
@@ -214,7 +216,6 @@ class TestXDMACopyBackend:
             expected = gpu_t[i].cpu().numpy().tobytes()
             assert buf == expected, f"Block {i} mismatch"
 
-        backend.shutdown()
 
 
 # ===========================================================================
@@ -247,7 +248,7 @@ class TestFPGAOffloadingWorker:
             ))
 
         refs = [
-            [CanonicalKVCacheRef(tensor_idx=i, logical_block_stride=1)
+            [CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=4096)
              for i in range(self.NUM_TENSORS)],
         ]
 
@@ -352,22 +353,41 @@ class TestFPGAOffloadingWorker:
 
 
 class TestFPGAOffloadingSpec:
+    @staticmethod
+    def _make_minimal_model_config():
+        """Create a minimal model config dict that FPGAOffloadingSpec needs.
+
+        Avoids network calls — only ``hidden_size``, ``num_hidden_layers``
+        and related fields are required by FPGAOffloadingSpec.
+        """
+        from vllm.config import ModelConfig
+        import transformers
+        import os
+
+        # Use OPT-125M as a tiny reference model available offline.
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        cfg = transformers.AutoConfig.from_pretrained(
+            "facebook/opt-125m", trust_remote_code=True,
+        )
+        return ModelConfig(
+            model="facebook/opt-125m",
+            tokenizer="facebook/opt-125m",
+            tokenizer_mode="auto",
+            trust_remote_code=True,
+            dtype="bfloat16",
+            seed=0,
+        )
+
     def test_spec_creation(self):
         """Create FPGAOffloadingSpec programmatically."""
-        from vllm.config import VllmConfig, ModelConfig, CacheConfig, \
+        import transformers
+        from vllm.config import VllmConfig, CacheConfig, \
             ParallelConfig, SchedulerConfig
         from vllm.config.kv_transfer import KVTransferConfig
         from vllm.v1.kv_cache_interface import KVCacheConfig
 
         config = VllmConfig(
-            model_config=ModelConfig(
-                model="meta-llama/Llama-3.1-8B",
-                tokenizer="meta-llama/Llama-3.1-8B",
-                tokenizer_mode="auto",
-                trust_remote_code=False,
-                dtype="bfloat16",
-                seed=0,
-            ),
+            model_config=self._make_minimal_model_config(),
             cache_config=CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
@@ -398,19 +418,12 @@ class TestFPGAOffloadingSpec:
 
     def test_factory_resolves_fpga_spec(self):
         """OffloadingSpecFactory resolves FPGAOffloadingSpec by name."""
-        from vllm.config import VllmConfig, ModelConfig, CacheConfig, \
+        from vllm.config import VllmConfig, CacheConfig, \
             ParallelConfig, SchedulerConfig
         from vllm.config.kv_transfer import KVTransferConfig
 
         config = VllmConfig(
-            model_config=ModelConfig(
-                model="meta-llama/Llama-3.1-8B",
-                tokenizer="meta-llama/Llama-3.1-8B",
-                tokenizer_mode="auto",
-                trust_remote_code=False,
-                dtype="bfloat16",
-                seed=0,
-            ),
+            model_config=self._make_minimal_model_config(),
             cache_config=CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
@@ -480,7 +493,7 @@ class TestFPGAIntegrationSmoke:
                 page_size_bytes=1024,
             ),
         ]
-        refs = [[CanonicalKVCacheRef(tensor_idx=0, logical_block_stride=1)]]
+        refs = [[CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=1024)]]
         kv_caches = CanonicalKVCaches(tensors=tensors, group_data_refs=refs)
 
         w = FPGAOffloadingWorker(
@@ -490,7 +503,7 @@ class TestFPGAIntegrationSmoke:
             fpga_capacity_bytes=4 * 1024,
         )
         assert w._fpga_alloc is not None
-        assert w._backend is not None
+        assert w._engine is not None
         w.shutdown()
 
 

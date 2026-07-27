@@ -174,7 +174,8 @@ class BlockTransferEngine:
                     if has_bounce:
                         # Step A: GPU → bounce buffer (CUDA stream).
                         bounce = self._bounce_buffer  # type: ignore[union-attr]
-                        bounce_view = bounce[:block_bytes].view(gpu_src.shape)
+                        bounce_view = bounce[:block_bytes].view(
+                            dtype=gpu_src.dtype).view(gpu_src.shape)
                         bounce_view.copy_(gpu_src, non_blocking=True)
 
                         # Step B: ensure bounce is ready, then write.
@@ -220,8 +221,8 @@ class BlockTransferEngine:
                     # Step B: bounce buffer → GPU.
                     with torch.cuda.stream(self._load_stream):
                         bounce_view = bounce[:block_bytes].view(
-                            gpu_tensor[gpu_bid].shape,
-                        )
+                            dtype=gpu_tensor[gpu_bid].dtype).view(
+                            gpu_tensor[gpu_bid].shape)
                         gpu_tensor[gpu_bid].copy_(bounce_view, non_blocking=True)
                 else:
                     # P2P path: single GPU DMA hop.
