@@ -224,7 +224,12 @@ class TestBlockTransferEngine:
 
 
 class TestFPGAOffloadingWorker:
-    NUM_BLOCKS = 8
+
+    """
+    测试FPGA卸载工作器的类，用于验证FPGA与GPU之间的数据传输功能。
+    包含常量定义和多个测试方法。
+    """
+    NUM_BLOCKS = 8  # 定义GPU中的块数量
     PAGE_SIZE = 4096  # 4 KB per page
     NUM_TENSORS = 2
     NUM_FPGA_BLOCKS = 16

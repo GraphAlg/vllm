@@ -48,8 +48,8 @@ class XDMABounceBufferBackend(DMABackend):
 
         self._bounce_buf = torch.zeros(
             bounce_buffer_size, dtype=torch.int8, device="cpu",
+            pin_memory=True,
         )
-        self._pin_tensor(self._bounce_buf)
 
         logger.info(
             "XDMABounceBufferBackend: bounce buffer = %.2f MiB",
@@ -79,14 +79,6 @@ class XDMABounceBufferBackend(DMABackend):
     @property
     def bounce_buffer(self) -> torch.Tensor:
         return self._bounce_buf
-
-    @staticmethod
-    def _pin_tensor(tensor: torch.Tensor) -> None:
-        err = torch.cuda.cudart().cudaHostRegister(
-            tensor.data_ptr(), tensor.nbytes, 0,
-        )
-        if err.value != 0:
-            raise RuntimeError(f"cudaHostRegister failed: {err}")
 
     def shutdown(self) -> None:
         super().shutdown()
