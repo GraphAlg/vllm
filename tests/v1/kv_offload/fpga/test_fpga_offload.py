@@ -384,8 +384,8 @@ class TestFPGAOffloadingSpec:
         from vllm.config import VllmConfig, CacheConfig, \
             ParallelConfig, SchedulerConfig
         from vllm.config.kv_transfer import KVTransferConfig
-        from vllm.v1.kv_cache_interface import KVCacheConfig
-
+        from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+     
         config = VllmConfig(
             model_config=self._make_minimal_model_config(),
             cache_config=CacheConfig(
