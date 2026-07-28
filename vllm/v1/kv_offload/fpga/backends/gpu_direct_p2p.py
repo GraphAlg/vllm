@@ -4,7 +4,7 @@
 
 Follows the reference C implementation pattern:
   1. cuCtxCreate → independent CUDA context
-  2. mmap FPGA BAR
+  2. mmap FPGA BAR  (via libc mmap, same as C code)
   3. cuMemHostRegister(IOMEMORY | DEVICEMAP)
   4. cuMemHostGetDevicePointer → d_bar
   5. cuMemcpyAsync(DeviceToDevice)  → zero-copy DMA
@@ -42,6 +42,23 @@ CU_MEMHOSTREGISTER_DEVICEMAP = 0x2
 
 _cuda = ctypes.CDLL("libcuda.so.1")
 
+# libc for raw mmap (matching C code exactly — get a bare void* pointer).
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.mmap.argtypes = [
+    ctypes.c_void_p,   # addr
+    ctypes.c_size_t,   # length
+    ctypes.c_int,      # prot
+    ctypes.c_int,      # flags
+    ctypes.c_int,      # fd
+    ctypes.c_off_t,    # offset
+]
+_libc.mmap.restype = ctypes.c_void_p
+
+_libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+_libc.munmap.restype = ctypes.c_int
+
+libc_MAP_FAILED = ctypes.c_void_p(-1).value
+
 
 def _resolve_symbol(*names: str):
     """Return the first CUDA Driver API symbol exported by the installed driver."""
@@ -58,12 +75,7 @@ def _resolve_symbol(*names: str):
 # Resolve versioned symbols (CUDA 12+ exports _v2 variants).
 _cuCtxCreate = _resolve_symbol("cuCtxCreate_v2", "cuCtxCreate")
 _cuCtxDestroy = _resolve_symbol("cuCtxDestroy_v2", "cuCtxDestroy")
-_cuCtxPushCurrent = _resolve_symbol(
-    "cuCtxPushCurrent_v2", "cuCtxPushCurrent",
-)
-_cuCtxPopCurrent = _resolve_symbol(
-    "cuCtxPopCurrent_v2", "cuCtxPopCurrent",
-)
+_cuCtxSetCurrent = _resolve_symbol("cuCtxSetCurrent")
 _cuMemHostGetDevicePointer = _resolve_symbol(
     "cuMemHostGetDevicePointer_v2",
     "cuMemHostGetDevicePointer",
@@ -94,11 +106,8 @@ def _configure_cuda_api() -> None:
     _cuCtxDestroy.argtypes = [CUcontext]
     _cuCtxDestroy.restype = CUresult
 
-    _cuCtxPushCurrent.argtypes = [CUcontext]
-    _cuCtxPushCurrent.restype = CUresult
-
-    _cuCtxPopCurrent.argtypes = [ctypes.POINTER(CUcontext)]
-    _cuCtxPopCurrent.restype = CUresult
+    _cuCtxSetCurrent.argtypes = [CUcontext]
+    _cuCtxSetCurrent.restype = CUresult
 
     _cuda.cuMemHostRegister.argtypes = [
         ctypes.c_void_p,
@@ -172,32 +181,6 @@ def _check_cu(ret: int, operation: str = "CUDA operation") -> None:
     )
 
 
-class _CudaContextScope:
-    """Push a CUDA context on the current thread; restore on exit.
-
-    CUDA contexts are thread-local.  This scope must wrap every Driver API
-    call made from a vLLM worker thread that isn't the initialisation thread.
-    """
-
-    def __init__(self, context: CUcontext) -> None:
-        self._context = context
-        self._active = False
-
-    def __enter__(self) -> "_CudaContextScope":
-        _check_cu(_cuCtxPushCurrent(self._context), "cuCtxPushCurrent")
-        self._active = True
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        if not self._active:
-            return
-        popped = CUcontext()
-        ret = int(_cuCtxPopCurrent(ctypes.byref(popped)))
-        self._active = False
-        if ret != CUDA_SUCCESS and exc_type is None:
-            _check_cu(ret, "cuCtxPopCurrent")
-
-
 # ── Backend ──────────────────────────────────────────────────────────────────
 
 
@@ -206,6 +189,7 @@ class GPUDirectP2PBackend(DMABackend):
 
     Mirrors the reference C implementation:
       - cuCtxCreate → independent CUDA context
+      - libc mmap → raw void* pointer
       - cuMemHostRegister(IOMEMORY | DEVICEMAP)
       - cuMemcpyAsync(DeviceToDevice)  (Driver API, no kind parameter)
     """
@@ -224,9 +208,7 @@ class GPUDirectP2PBackend(DMABackend):
         self._lock = threading.RLock()
         self._device_id = int(device_id)
         self._map_size = int(map_size)
-        self._bar: mmap.mmap | None = None
-        self._bar_view: ctypes.Array[ctypes.c_ubyte] | None = None
-        self._bar_base = 0
+        self._bar_ptr = ctypes.c_void_p()   # raw void* from mmap (matches C code)
         self._d_bar = 0
         self._ctx = CUcontext()
         self._registered = False
@@ -263,53 +245,62 @@ class GPUDirectP2PBackend(DMABackend):
     def _map_and_register_bar(self) -> None:
         bar_path = f"/sys/bus/pci/devices/{FPGA_PCI_BDF}/resource{FPGA_BAR_INDEX}"
 
-        # Keep the fd open during cuMemHostRegister — the CUDA driver may
-        # need it to validate the I/O VMA on PCIe BAR mappings.  This matches
-        # the working C reference code.
+        # Keep fd open during cuMemHostRegister (matches C code).
         fd = os.open(bar_path, os.O_RDWR | os.O_SYNC)
         try:
-            self._bar = mmap.mmap(fd, self._map_size, mmap.MAP_SHARED,
-                                  mmap.PROT_READ | mmap.PROT_WRITE)
-
-            # Keep the ctypes view alive for the entire registration lifetime
-            # so the refcount doesn't drop before cuMemHostUnregister.
-            self._bar_view = (ctypes.c_ubyte * self._map_size).from_buffer(
-                self._bar,
+            # Use libc mmap directly to get a raw void*, matching C code exactly.
+            result = _libc.mmap(
+                None,
+                self._map_size,
+                mmap.PROT_READ | mmap.PROT_WRITE,
+                mmap.MAP_SHARED,
+                fd,
+                0,  # offset
             )
-            self._bar_base = ctypes.addressof(self._bar_view)
+            if result.value == libc_MAP_FAILED:
+                err = ctypes.get_errno()
+                raise OSError(err, f"mmap of {bar_path} failed: "
+                                   f"{os.strerror(err)}")
+            self._bar_ptr = result
 
-            with _CudaContextScope(self._ctx):
-                _check_cu(
-                    _cuda.cuMemHostRegister(
-                        ctypes.c_void_p(self._bar_base),
-                        ctypes.c_size_t(self._map_size),
-                        ctypes.c_uint(
-                            CU_MEMHOSTREGISTER_IOMEMORY
-                            | CU_MEMHOSTREGISTER_DEVICEMAP,
-                        ),
-                    ),
-                    "cuMemHostRegister",
-                )
-                self._registered = True
+            # cuCtxCreate already made the context current on this thread.
+            # Use cuCtxSetCurrent (not PushCurrent) to mirror the C code.
+            _check_cu(
+                _cuCtxSetCurrent(self._ctx),
+                "cuCtxSetCurrent",
+            )
 
-                d_bar = CUdeviceptr()
-                _check_cu(
-                    _cuMemHostGetDevicePointer(
-                        ctypes.byref(d_bar),
-                        ctypes.c_void_p(self._bar_base),
-                        0,
+            _check_cu(
+                _cuda.cuMemHostRegister(
+                    self._bar_ptr,
+                    ctypes.c_size_t(self._map_size),
+                    ctypes.c_uint(
+                        CU_MEMHOSTREGISTER_IOMEMORY
+                        | CU_MEMHOSTREGISTER_DEVICEMAP,
                     ),
-                    "cuMemHostGetDevicePointer",
-                )
+                ),
+                "cuMemHostRegister",
+            )
+            self._registered = True
+
+            d_bar = CUdeviceptr()
+            _check_cu(
+                _cuMemHostGetDevicePointer(
+                    ctypes.byref(d_bar),
+                    self._bar_ptr,
+                    0,
+                ),
+                "cuMemHostGetDevicePointer",
+            )
 
         finally:
             os.close(fd)
 
         self._d_bar = int(d_bar.value)
         logger.info(
-            "GPUDirectP2PBackend: %s  ctx=0x%x  d_bar=0x%x  size=%.1f GB",
-            bar_path, self._ctx.value, self._d_bar,
-            self._map_size / (1024**3),
+            "GPUDirectP2PBackend: %s  ctx=0x%x  bar_ptr=0x%x  d_bar=0x%x  size=%.1f GB",
+            bar_path, self._ctx.value, self._bar_ptr.value,
+            self._d_bar, self._map_size / (1024**3),
         )
 
     # ── DMABackend ──────────────────────────────────────────────────────────
@@ -343,21 +334,25 @@ class GPUDirectP2PBackend(DMABackend):
             return
 
         with self._lock:
-            with _CudaContextScope(self._ctx):
-                _check_cu(
-                    _cuMemcpyAsync(
-                        CUdeviceptr(dst),
-                        CUdeviceptr(src),
-                        ctypes.c_size_t(size),
-                        CUstream(None),
-                    ),
-                    f"{operation}: cuMemcpyAsync",
-                )
+            _check_cu(
+                _cuCtxSetCurrent(self._ctx),
+                f"{operation}: cuCtxSetCurrent",
+            )
 
-                _check_cu(
-                    _cuStreamSynchronize(CUstream(None)),
-                    f"{operation}: cuStreamSynchronize",
-                )
+            _check_cu(
+                _cuMemcpyAsync(
+                    CUdeviceptr(dst),
+                    CUdeviceptr(src),
+                    ctypes.c_size_t(size),
+                    CUstream(None),
+                ),
+                f"{operation}: cuMemcpyAsync",
+            )
+
+            _check_cu(
+                _cuStreamSynchronize(CUstream(None)),
+                f"{operation}: cuStreamSynchronize",
+            )
 
     @property
     def bar_devptr(self) -> int:
@@ -379,27 +374,24 @@ class GPUDirectP2PBackend(DMABackend):
     def _release_resources(self) -> None:
         unreg_error: BaseException | None = None
 
-        if self._registered and self._bar_base and self._ctx.value:
+        if self._registered and self._bar_ptr and self._bar_ptr.value:
             try:
-                with _CudaContextScope(self._ctx):
-                    _cuda.cuMemHostUnregister(
-                        ctypes.c_void_p(self._bar_base),
-                    )
+                _check_cu(
+                    _cuCtxSetCurrent(self._ctx),
+                    "cuCtxSetCurrent (unregister)",
+                )
+                _cuda.cuMemHostUnregister(self._bar_ptr)
             except BaseException as exc:
                 unreg_error = exc
             finally:
                 self._registered = False
 
-        # Release ctypes view before the mmap it wraps.
-        self._bar_view = None
-        self._bar_base = 0
         self._d_bar = 0
 
-        if self._bar is not None:
-            try:
-                self._bar.close()
-            finally:
-                self._bar = None
+        # munmap using the raw pointer (matching libc mmap).
+        if self._bar_ptr and self._bar_ptr.value:
+            _libc.munmap(self._bar_ptr, self._map_size)
+            self._bar_ptr = ctypes.c_void_p()
 
         if self._ctx.value:
             try:
