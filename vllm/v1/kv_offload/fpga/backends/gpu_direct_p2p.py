@@ -50,7 +50,7 @@ _libc.mmap.argtypes = [
     ctypes.c_int,      # prot
     ctypes.c_int,      # flags
     ctypes.c_int,      # fd
-    ctypes.c_off_t,    # offset
+    ctypes.c_int64,    # offset (off_t on x86-64 Linux)
 ]
 _libc.mmap.restype = ctypes.c_void_p
 
@@ -155,6 +155,40 @@ def _configure_cuda_api() -> None:
 _configure_cuda_api()
 
 
+def _resolve_map_size(
+    bar_path: str,
+    requested_map_size: int,
+    default_size: int,
+) -> int:
+    """Resolve a BAR mapping size that is compatible with CUDA registration."""
+    if requested_map_size == 0:
+        requested_map_size = default_size
+
+    if requested_map_size <= 0:
+        raise ValueError(
+            f"map_size must be positive, got {requested_map_size}"
+        )
+
+    if not os.path.exists(bar_path):
+        raise FileNotFoundError(f"FPGA BAR resource does not exist: {bar_path}")
+
+    resource_size = os.path.getsize(bar_path)
+    if resource_size > 0:
+        requested_map_size = min(requested_map_size, resource_size)
+
+    page_size = mmap.PAGESIZE
+    if requested_map_size % page_size != 0:
+        requested_map_size -= requested_map_size % page_size
+
+    if requested_map_size <= 0:
+        raise ValueError(
+            "Resolved BAR mapping size is too small for CUDA registration: "
+            f"requested={requested_map_size}, page_size={page_size}"
+        )
+
+    return requested_map_size
+
+
 def _check_cu(ret: int, operation: str = "CUDA operation") -> None:
     """Raise a readable exception for a CUDA Driver API result."""
     code = int(ret)
@@ -202,12 +236,18 @@ class GPUDirectP2PBackend(DMABackend):
     ) -> None:
         super().__init__(fpga_allocator)
 
-        if map_size == 0:
-            map_size = FPGA_BAR_SIZE
-
         self._lock = threading.RLock()
         self._device_id = int(device_id)
-        self._map_size = int(map_size)
+        self._bar_path = (
+            f"/sys/bus/pci/devices/{FPGA_PCI_BDF}/resource{FPGA_BAR_INDEX}"
+        )
+        self._map_size = int(
+            _resolve_map_size(
+                self._bar_path,
+                int(map_size),
+                FPGA_BAR_SIZE,
+            )
+        )
         self._bar_ptr = ctypes.c_void_p()   # raw void* from mmap (matches C code)
         self._d_bar = 0
         self._ctx = CUcontext()
