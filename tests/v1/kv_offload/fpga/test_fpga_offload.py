@@ -224,12 +224,7 @@ class TestBlockTransferEngine:
 
 
 class TestFPGAOffloadingWorker:
-
-    """
-    测试FPGA卸载工作器的类，用于验证FPGA与GPU之间的数据传输功能。
-    包含常量定义和多个测试方法。
-    """
-    NUM_BLOCKS = 8  # 定义GPU中的块数量
+    NUM_BLOCKS = 8
     PAGE_SIZE = 4096  # 4 KB per page
     NUM_TENSORS = 2
     NUM_FPGA_BLOCKS = 16
@@ -423,12 +418,19 @@ class TestFPGAOffloadingSpec:
 
     def test_factory_resolves_fpga_spec(self):
         """OffloadingSpecFactory resolves FPGAOffloadingSpec by name."""
-        from vllm.config import VllmConfig, CacheConfig, \
+        from vllm.config import VllmConfig, ModelConfig, CacheConfig, \
             ParallelConfig, SchedulerConfig
         from vllm.config.kv_transfer import KVTransferConfig
 
         config = VllmConfig(
-            model_config=self._make_minimal_model_config(),
+            model_config=ModelConfig(
+                model="meta-llama/Llama-3.1-8B",
+                tokenizer="meta-llama/Llama-3.1-8B",
+                tokenizer_mode="auto",
+                trust_remote_code=False,
+                dtype="bfloat16",
+                seed=0,
+            ),
             cache_config=CacheConfig(
                 block_size=16,
                 gpu_memory_utilization=0.9,
@@ -498,7 +500,7 @@ class TestFPGAIntegrationSmoke:
                 page_size_bytes=1024,
             ),
         ]
-        refs = [[CanonicalKVCacheRef(tensor_idx=0, page_size_bytes=1024)]]
+        refs = [[CanonicalKVCacheRef(tensor_idx=0, logical_block_stride=1)]]
         kv_caches = CanonicalKVCaches(tensors=tensors, group_data_refs=refs)
 
         w = FPGAOffloadingWorker(
@@ -508,7 +510,7 @@ class TestFPGAIntegrationSmoke:
             fpga_capacity_bytes=4 * 1024,
         )
         assert w._fpga_alloc is not None
-        assert w._engine is not None
+        assert w._backend is not None
         w.shutdown()
 
 
