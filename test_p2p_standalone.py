@@ -30,7 +30,7 @@ def now_sec():
 
 
 # ── Config (matching gpu_dma_mix.cu) ──────────────────────────────────────────
-BAR_PATH = "/sys/bus/pci/devices/0000:35:00.0/resource4"
+BAR_PATH = "/sys/bus/pci/devices/0000:88:00.0/resource2"
 MAP_SIZE = 1024 * 1024 * 1024       # 1 GB
 TARGET_SECONDS = 5.0                 # 跑 5 秒
 DEVICE_ID = 0
