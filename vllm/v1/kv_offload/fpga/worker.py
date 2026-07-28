@@ -105,15 +105,7 @@ def _create_backend_and_allocator(
             GPUDirectP2PBackend,
         )
 
-        bar_cuda_ptr = int(os.environ.get("VLLM_FPGA_BAR_ADDR", "0"), 16)
-        if bar_cuda_ptr == 0:
-            raise RuntimeError(
-                "GPUDirectP2PBackend requires VLLM_FPGA_BAR_ADDR "
-                "(CUDA virtual address of FPGA BAR). "
-                "Set it via env or import your driver module here."
-            )
-
-        # P2P allocator: no XDMA handle needed, just block management.
+        # BAR 路径和大小从环境变量读取，不需要手动传地址
         from vllm.v1.kv_offload.fpga.xdma_driver import MockXDMAHandle
         allocator = FPGABlockAllocator(
             fpga=MockXDMAHandle(ddr_size=fpga_capacity_bytes),
@@ -122,10 +114,7 @@ def _create_backend_and_allocator(
         )
         backend = GPUDirectP2PBackend(
             fpga_allocator=allocator,
-            bar_cuda_ptr=bar_cuda_ptr,
-            block_size=total_bytes_per_block,
-            store_stream=store_stream,
-            load_stream=load_stream,
+            stream=store_stream,
         )
         return backend, allocator
 
