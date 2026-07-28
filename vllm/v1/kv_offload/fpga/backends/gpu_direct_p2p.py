@@ -34,9 +34,17 @@ import os
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.kv_offload.fpga.allocator import FPGABlockAllocator
 from vllm.v1.kv_offload.fpga.backend_base import DMABackend
 
 logger = init_logger(__name__)
+
+# ── Hardware config ─────────────────────────────────────────────────────────
+# 按你的 FPGA 实际配置修改这些常量
+
+FPGA_PCI_BDF = "0000:88:00.0"        # lspci 看到的 BDF
+FPGA_BAR_INDEX = 2                    # 存放 DRAM 的 BAR 编号
+FPGA_BAR_SIZE = 4 * 1024**3           # BAR 空间大小 (4 GB)
 
 # ── CUDA Driver API constants and helpers ──────────────────────────────────
 
@@ -72,22 +80,22 @@ class GPUDirectP2PBackend(DMABackend):
     def __init__(
         self,
         fpga_allocator: FPGABlockAllocator,  # noqa: F821
-        bar_path: str | None = None,
-        map_size: int = 0,
+        device_id: int = 0,
         stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__(fpga_allocator)
 
-        # ── 1. Resolve BAR path ──────────────────────────────────────────────
-        if bar_path is None:
-            bdf = os.environ.get("VLLM_FPGA_BDF", "0000:88:00.0")
-            bar_idx = os.environ.get("VLLM_FPGA_BAR_INDEX", "2")
-            bar_path = f"/sys/bus/pci/devices/{bdf}/resource{bar_idx}"
-        self._bar_path = bar_path
+        # ── 0. Switch to the target GPU device ──────────────────────────────
+        dev = ctypes.c_int(device_id)
+        _check_cu(_cuda.cuDeviceGet(ctypes.byref(dev), dev))
 
-        if map_size == 0:
-            map_size = int(os.environ.get("VLLM_FPGA_BAR_SIZE", str(4 * 1024**3)))
-        self._map_size = map_size
+        ctx = ctypes.c_void_p()
+        _check_cu(_cuda.cuCtxCreate(ctypes.byref(ctx), 0, dev))
+        self._ctx = ctx
+
+        # ── 1. Build BAR path from hardcoded constants ───────────────────────
+        bar_path = f"/sys/bus/pci/devices/{FPGA_PCI_BDF}/resource{FPGA_BAR_INDEX}"
+        map_size = FPGA_BAR_SIZE
 
         # ── 2. mmap BAR ──────────────────────────────────────────────────────
         fd = os.open(bar_path, os.O_RDWR | os.O_SYNC)
@@ -163,3 +171,6 @@ class GPUDirectP2PBackend(DMABackend):
             _cuda.cuMemHostUnregister(ctypes.c_void_p(bar_base))
             self._bar.close()
             self._bar = None
+        if hasattr(self, "_ctx") and self._ctx is not None:
+            _cuda.cuCtxDestroy(self._ctx)
+            self._ctx = None
