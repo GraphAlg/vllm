@@ -24,8 +24,8 @@ from vllm.v1.kv_offload.fpga.backend_base import DMABackend
 logger = init_logger(__name__)
 
 # ── Hardware config ─────────────────────────────────────────────────────────
-FPGA_PCI_BDF = "0000:35:00.0"
-FPGA_BAR_INDEX = 4
+FPGA_PCI_BDF = "0000:88:00.0"
+FPGA_BAR_INDEX = 2
 FPGA_BAR_SIZE = 1 * 1024**3          # 1 GB
 
 # ── CUDA Driver API types ───────────────────────────────────────────────────
@@ -262,40 +262,48 @@ class GPUDirectP2PBackend(DMABackend):
 
     def _map_and_register_bar(self) -> None:
         bar_path = f"/sys/bus/pci/devices/{FPGA_PCI_BDF}/resource{FPGA_BAR_INDEX}"
+
+        # Keep the fd open during cuMemHostRegister — the CUDA driver may
+        # need it to validate the I/O VMA on PCIe BAR mappings.  This matches
+        # the working C reference code.
         fd = os.open(bar_path, os.O_RDWR | os.O_SYNC)
         try:
             self._bar = mmap.mmap(fd, self._map_size, mmap.MAP_SHARED,
                                   mmap.PROT_READ | mmap.PROT_WRITE)
+
+            # Keep the ctypes view alive for the entire registration lifetime
+            # so the refcount doesn't drop before cuMemHostUnregister.
+            self._bar_view = (ctypes.c_ubyte * self._map_size).from_buffer(
+                self._bar,
+            )
+            self._bar_base = ctypes.addressof(self._bar_view)
+
+            with _CudaContextScope(self._ctx):
+                _check_cu(
+                    _cuda.cuMemHostRegister(
+                        ctypes.c_void_p(self._bar_base),
+                        ctypes.c_size_t(self._map_size),
+                        ctypes.c_uint(
+                            CU_MEMHOSTREGISTER_IOMEMORY
+                            | CU_MEMHOSTREGISTER_DEVICEMAP,
+                        ),
+                    ),
+                    "cuMemHostRegister",
+                )
+                self._registered = True
+
+                d_bar = CUdeviceptr()
+                _check_cu(
+                    _cuMemHostGetDevicePointer(
+                        ctypes.byref(d_bar),
+                        ctypes.c_void_p(self._bar_base),
+                        0,
+                    ),
+                    "cuMemHostGetDevicePointer",
+                )
+
         finally:
             os.close(fd)
-
-        # Keep the ctypes view alive for the entire registration lifetime
-        # so the refcount doesn't drop before cuMemHostUnregister.
-        self._bar_view = (ctypes.c_ubyte * self._map_size).from_buffer(self._bar)
-        self._bar_base = ctypes.addressof(self._bar_view)
-
-        with _CudaContextScope(self._ctx):
-            _check_cu(
-                _cuda.cuMemHostRegister(
-                    ctypes.c_void_p(self._bar_base),
-                    ctypes.c_size_t(self._map_size),
-                    ctypes.c_uint(
-                        CU_MEMHOSTREGISTER_IOMEMORY | CU_MEMHOSTREGISTER_DEVICEMAP,
-                    ),
-                ),
-                "cuMemHostRegister",
-            )
-            self._registered = True
-
-            d_bar = CUdeviceptr()
-            _check_cu(
-                _cuMemHostGetDevicePointer(
-                    ctypes.byref(d_bar),
-                    ctypes.c_void_p(self._bar_base),
-                    0,
-                ),
-                "cuMemHostGetDevicePointer",
-            )
 
         self._d_bar = int(d_bar.value)
         logger.info(
