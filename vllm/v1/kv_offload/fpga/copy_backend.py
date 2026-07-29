@@ -79,9 +79,10 @@ class BlockTransferEngine:
             target=self._copy_loop, daemon=True,
         )
 
-        # Event_idx → threading.Event for race-free completion signaling.
-        # Set when the CUDA event has been recorded on the transfer stream.
-        self._done_signals: dict[int, threading.Event] = {}
+        # Event_idx → [threading.Event, torch.Event | None] for race-free
+        # completion signaling.  The background thread fills in the CUDA event
+        # and sets the threading.Event; the waiting thread reads both.
+        self._done_signals: dict[int, list] = {}
         self._done_lock = threading.Lock()
 
         self._thread.start()
@@ -119,7 +120,7 @@ class BlockTransferEngine:
         """
         # Register a threading.Event so wait_for_copy() can wait without polling.
         with self._done_lock:
-            self._done_signals[event_idx] = threading.Event()
+            self._done_signals[event_idx] = [threading.Event(), None]
 
         self._queue.put((
             src_blocks, dst_blocks,
@@ -141,21 +142,28 @@ class BlockTransferEngine:
             KeyError: if *event_idx* is unknown or was already consumed.
         """
         with self._done_lock:
-            signal = self._done_signals.get(event_idx)
-        if signal is None:
+            entry = self._done_signals.get(event_idx)
+        if entry is None:
             raise KeyError(
                 f"No pending transfer with event_idx={event_idx}"
             )
+        signal = entry[0]
+
         if not signal.wait(timeout=timeout):
             raise TimeoutError(
                 f"Transfer {event_idx} did not complete within {timeout}s"
             )
 
-        # The calling thread must have a CUDA context for event.synchronize().
-        # PyTorch's event.synchronize() handles this internally.
-        with self._done_lock:
-            signal, cuda_event = self._done_signals.pop(event_idx)
+        # The background thread filled entry[1] with the CUDA event before
+        # calling signal.set(), so it is guaranteed to be populated now.
+        cuda_event = entry[1]
+        assert cuda_event is not None, (
+            f"Transfer {event_idx}: CUDA event was not recorded"
+        )
         cuda_event.synchronize()
+
+        with self._done_lock:
+            self._done_signals.pop(event_idx, None)
         return (event_idx, cuda_event)
 
     def shutdown(self) -> None:
@@ -168,8 +176,8 @@ class BlockTransferEngine:
             self._thread.join(timeout=5.0)
         # Wake any waiters that will never be signalled.
         with self._done_lock:
-            for signal in self._done_signals.values():
-                signal.set()
+            for entry in self._done_signals.values():
+                entry[0].set()
             self._done_signals.clear()
         self._backend.shutdown()
 
@@ -190,9 +198,9 @@ class BlockTransferEngine:
                 logger.error("BlockTransferEngine transfer failed: %s", e)
                 # Signal failure so wait_for_copy doesn't hang forever.
                 with self._done_lock:
-                    signal = self._done_signals.pop(eid, None)
-                if signal:
-                    signal.set()
+                    entry = self._done_signals.get(eid)
+                    if entry is not None:
+                        entry[0].set()
                 continue
 
             stream = self._store_stream if is_store else self._load_stream
@@ -201,12 +209,13 @@ class BlockTransferEngine:
                 event.record(stream)
             events.append((eid, event))
 
-            # Signal that the CUDA event is in the events list.
-            # The waiting thread can now call event.synchronize().
+            # Store the CUDA event in the done entry, then signal.
+            # wait_for_copy reads both fields without racing.
             with self._done_lock:
-                signal = self._done_signals.pop(eid, None)
-            if signal:
-                signal.set()
+                entry = self._done_signals.get(eid)
+                if entry is not None:
+                    entry[1] = event
+                    entry[0].set()
 
     # -- Store: GPU → FPGA ----------------------------------------------------
 
