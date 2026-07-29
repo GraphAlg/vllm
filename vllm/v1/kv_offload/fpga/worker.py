@@ -112,9 +112,11 @@ def _create_backend_and_allocator(
             dram_size_bytes=fpga_capacity_bytes,
             block_size_bytes=total_bytes_per_block,
         )
+
+        device_id = int(os.environ.get("VLLM_FPGA_DEVICE_ID", "0"))
         backend = GPUDirectP2PBackend(
             fpga_allocator=allocator,
-            stream=store_stream,
+            device_id=device_id,
         )
         return backend, allocator
 
