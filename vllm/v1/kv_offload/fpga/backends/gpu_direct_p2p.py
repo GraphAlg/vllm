@@ -60,7 +60,18 @@ def _resolve_symbol(*names: str):
 
 
 # Resolve versioned symbols (CUDA 12+ exports _v2 variants).
+# NOTE: For cuMemHostRegister / cuMemHostUnregister we MUST resolve the
+# _v2 variant explicitly — CUDA 13+ has separate function pointers for
+# the legacy and v2 symbols, and the legacy variant rejects IOMEMORY.
 _cuCtxSetCurrent = _resolve_symbol("cuCtxSetCurrent")
+_cuMemHostRegister = _resolve_symbol(
+    "cuMemHostRegister_v2",
+    "cuMemHostRegister",
+)
+_cuMemHostUnregister = _resolve_symbol(
+    "cuMemHostUnregister_v2",
+    "cuMemHostUnregister",
+)
 _cuMemHostGetDevicePointer = _resolve_symbol(
     "cuMemHostGetDevicePointer_v2",
     "cuMemHostGetDevicePointer",
@@ -93,15 +104,15 @@ def _configure_cuda_api() -> None:
     _cuCtxSetCurrent.argtypes = [CUcontext]
     _cuCtxSetCurrent.restype = CUresult
 
-    _cuda.cuMemHostRegister.argtypes = [
+    _cuMemHostRegister.argtypes = [
         ctypes.c_void_p,
         ctypes.c_size_t,
         ctypes.c_uint,
     ]
-    _cuda.cuMemHostRegister.restype = CUresult
+    _cuMemHostRegister.restype = CUresult
 
-    _cuda.cuMemHostUnregister.argtypes = [ctypes.c_void_p]
-    _cuda.cuMemHostUnregister.restype = CUresult
+    _cuMemHostUnregister.argtypes = [ctypes.c_void_p]
+    _cuMemHostUnregister.restype = CUresult
 
     _cuMemHostGetDevicePointer.argtypes = [
         ctypes.POINTER(CUdeviceptr),
@@ -253,7 +264,7 @@ class GPUDirectP2PBackend(DMABackend):
         )
 
         _check_cu(
-            _cuda.cuMemHostRegister(
+            _cuMemHostRegister(
                 ctypes.c_void_p(self._bar_base),
                 ctypes.c_size_t(self._map_size),
                 ctypes.c_uint(
@@ -359,7 +370,7 @@ class GPUDirectP2PBackend(DMABackend):
                     _cuCtxSetCurrent(self._ctx),
                     "cuCtxSetCurrent (unregister)",
                 )
-                _cuda.cuMemHostUnregister(
+                _cuMemHostUnregister(
                     ctypes.c_void_p(self._bar_base),
                 )
             except BaseException as exc:
