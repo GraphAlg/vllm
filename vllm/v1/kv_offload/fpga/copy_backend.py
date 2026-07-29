@@ -78,6 +78,12 @@ class BlockTransferEngine:
         self._thread = threading.Thread(
             target=self._copy_loop, daemon=True,
         )
+
+        # Event_idx → threading.Event for race-free completion signaling.
+        # Set when the CUDA event has been recorded on the transfer stream.
+        self._done_signals: dict[int, threading.Event] = {}
+        self._done_lock = threading.Lock()
+
         self._thread.start()
 
         logger.info(
@@ -111,10 +117,46 @@ class BlockTransferEngine:
             wait_event: If given, the store stream waits for this event
                         before launching (ensures GPU compute has finished).
         """
+        # Register a threading.Event so wait_for_copy() can wait without polling.
+        with self._done_lock:
+            self._done_signals[event_idx] = threading.Event()
+
         self._queue.put((
             src_blocks, dst_blocks,
             is_store, event_idx, events_list, wait_event,
         ))
+
+    def wait_for_copy(self, event_idx: int, timeout: float | None = None
+                      ) -> tuple[int, torch.Event]:
+        """Block until the transfer with *event_idx* completes.
+
+        Returns the ``(event_idx, torch.Event)`` tuple.
+
+        Args:
+            event_idx: event index passed to ``launch_copy``.
+            timeout: seconds to wait before raising ``TimeoutError``.
+
+        Raises:
+            TimeoutError: if the transfer does not finish within *timeout*.
+            KeyError: if *event_idx* is unknown or was already consumed.
+        """
+        with self._done_lock:
+            signal = self._done_signals.get(event_idx)
+        if signal is None:
+            raise KeyError(
+                f"No pending transfer with event_idx={event_idx}"
+            )
+        if not signal.wait(timeout=timeout):
+            raise TimeoutError(
+                f"Transfer {event_idx} did not complete within {timeout}s"
+            )
+
+        # The calling thread must have a CUDA context for event.synchronize().
+        # PyTorch's event.synchronize() handles this internally.
+        with self._done_lock:
+            signal, cuda_event = self._done_signals.pop(event_idx)
+        cuda_event.synchronize()
+        return (event_idx, cuda_event)
 
     def shutdown(self) -> None:
         if self._shutdown:
@@ -124,6 +166,11 @@ class BlockTransferEngine:
             self._queue.put(None)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+        # Wake any waiters that will never be signalled.
+        with self._done_lock:
+            for signal in self._done_signals.values():
+                signal.set()
+            self._done_signals.clear()
         self._backend.shutdown()
 
     # -- Background copy loop -------------------------------------------------
@@ -141,13 +188,25 @@ class BlockTransferEngine:
                     self._do_load(src, dst)
             except Exception as e:
                 logger.error("BlockTransferEngine transfer failed: %s", e)
-                raise
+                # Signal failure so wait_for_copy doesn't hang forever.
+                with self._done_lock:
+                    signal = self._done_signals.pop(eid, None)
+                if signal:
+                    signal.set()
+                continue
 
             stream = self._store_stream if is_store else self._load_stream
             with torch.cuda.stream(stream):
                 event = torch.Event()
                 event.record(stream)
             events.append((eid, event))
+
+            # Signal that the CUDA event is in the events list.
+            # The waiting thread can now call event.synchronize().
+            with self._done_lock:
+                signal = self._done_signals.pop(eid, None)
+            if signal:
+                signal.set()
 
     # -- Store: GPU → FPGA ----------------------------------------------------
 
