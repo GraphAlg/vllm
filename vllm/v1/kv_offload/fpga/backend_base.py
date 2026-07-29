@@ -24,24 +24,28 @@ class DMABackend(ABC):
         self._fpga_alloc = fpga_allocator
 
     @abstractmethod
-    def write(self, src_ptr: int, dst_addr: int, size: int) -> None:
+    def write(self, src_ptr: int, dst_addr: int, size: int,
+              stream: int = 0) -> None:
         """Host/GPU → FPGA 数据传输。
 
         Args:
             src_ptr: 源数据的内存地址 (CPU 虚拟地址 或 GPU 设备指针)
             dst_addr: FPGA 侧目标地址 (由 get_block_addr 得到)
             size: 传输字节数
+            stream: 可选的 raw CUstream handle，默认 0 (NULL stream)
         """
         ...
 
     @abstractmethod
-    def read(self, src_addr: int, dst_ptr: int, size: int) -> None:
+    def read(self, src_addr: int, dst_ptr: int, size: int,
+             stream: int = 0) -> None:
         """FPGA → Host/GPU 数据传输。
 
         Args:
             src_addr: FPGA 侧源地址
             dst_ptr: 目标内存地址
             size: 传输字节数
+            stream: 可选的 raw CUstream handle，默认 0 (NULL stream)
         """
         ...
 

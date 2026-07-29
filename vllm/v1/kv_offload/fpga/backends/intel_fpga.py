@@ -64,26 +64,20 @@ class IntelFPGAP2PBackend(DMABackend):
 
     # -- TODO: implement these two methods with your driver API ----------
 
-    def write(self, src_ptr: int, dst_addr: int, size: int) -> None:
+    def write(self, src_ptr: int, dst_addr: int, size: int,
+              stream: int = 0) -> None:
         """Host/GPU memory → Intel FPGA DRAM.
-
-        Example (replace with actual driver call):
-            self._lib.intel_fpga_dma_write(
-                self._handle, src_ptr, dst_addr, size,
-            )
+        ``stream`` is unused for Intel FPGA.
         """
         raise NotImplementedError(
             "IntelFPGAP2PBackend.write() — implement me using "
             "your Intel FPGA driver API"
         )
 
-    def read(self, src_addr: int, dst_ptr: int, size: int) -> None:
+    def read(self, src_addr: int, dst_ptr: int, size: int,
+             stream: int = 0) -> None:
         """Intel FPGA DRAM → Host/GPU memory.
-
-        Example:
-            self._lib.intel_fpga_dma_read(
-                self._handle, src_addr, dst_ptr, size,
-            )
+        ``stream`` is unused for Intel FPGA.
         """
         raise NotImplementedError(
             "IntelFPGAP2PBackend.read() — implement me using "

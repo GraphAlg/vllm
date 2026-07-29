@@ -60,19 +60,23 @@ class XDMABounceBufferBackend(DMABackend):
     def name(self) -> str:
         return "XDMA_BOUNCE_BUFFER"
 
-    def write(self, src_ptr: int, dst_addr: int, size: int) -> None:
+    def write(self, src_ptr: int, dst_addr: int, size: int,
+              stream: int = 0) -> None:
         """Bounce buffer → FPGA via XDMA write.
 
         The caller (BlockTransferEngine) has already staged GPU data into
         ``self._bounce_buf`` before calling this method.
+        ``stream`` is unused for XDMA (no CUDA involvement).
         """
         self._fpga.write(self._bounce_buf.data_ptr(), dst_addr, size)
 
-    def read(self, src_addr: int, dst_ptr: int, size: int) -> None:
+    def read(self, src_addr: int, dst_ptr: int, size: int,
+             stream: int = 0) -> None:
         """FPGA → bounce buffer via XDMA read.
 
         The caller (BlockTransferEngine) copies from ``self._bounce_buf``
         to GPU after this method returns.
+        ``stream`` is unused for XDMA (no CUDA involvement).
         """
         self._fpga.read(self._bounce_buf.data_ptr(), src_addr, size)
 

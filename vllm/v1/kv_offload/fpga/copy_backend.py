@@ -184,9 +184,10 @@ class BlockTransferEngine:
                             bounce.data_ptr(), fpga_addr, block_bytes,
                         )
                     else:
-                        # P2P path: single GPU DMA hop.
+                        # P2P path: single GPU DMA hop on the store stream.
                         self._backend.write(
                             gpu_src.data_ptr(), fpga_addr, block_bytes,
+                            stream=self._store_stream.cuda_stream,
                         )
 
         logger.debug(
@@ -225,9 +226,10 @@ class BlockTransferEngine:
                             gpu_tensor[gpu_bid].shape)
                         gpu_tensor[gpu_bid].copy_(bounce_view, non_blocking=True)
                 else:
-                    # P2P path: single GPU DMA hop.
+                    # P2P path: single GPU DMA hop on the load stream.
                     self._backend.read(
                         fpga_addr, gpu_tensor[gpu_bid].data_ptr(), block_bytes,
+                        stream=self._load_stream.cuda_stream,
                     )
 
         logger.debug(

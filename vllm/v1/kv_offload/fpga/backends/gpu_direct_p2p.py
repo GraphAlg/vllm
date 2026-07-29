@@ -299,29 +299,36 @@ class GPUDirectP2PBackend(DMABackend):
     def name(self) -> str:
         return "GPU_DIRECT_P2P"
 
-    def write(self, src_ptr: int, dst_addr: int, size: int) -> None:
+    def write(self, src_ptr: int, dst_addr: int, size: int,
+              stream: int = 0) -> None:
         """cuMemcpyAsync(DeviceToDevice) → FPGA BAR."""
         self._copy_and_wait(
             dst=self._d_bar + dst_addr,
             src=src_ptr,
             size=size,
+            stream=stream,
             operation="write",
         )
 
-    def read(self, src_addr: int, dst_ptr: int, size: int) -> None:
+    def read(self, src_addr: int, dst_ptr: int, size: int,
+             stream: int = 0) -> None:
         """cuMemcpyAsync(DeviceToDevice) from FPGA BAR."""
         self._copy_and_wait(
             dst=dst_ptr,
             src=self._d_bar + src_addr,
             size=size,
+            stream=stream,
             operation="read",
         )
 
     def _copy_and_wait(
         self, dst: int, src: int, size: int, operation: str,
+        stream: int = 0,
     ) -> None:
         if size == 0:
             return
+
+        cu_stream = CUstream(stream) if stream else CUstream(None)
 
         with self._lock:
             _check_cu(
@@ -334,13 +341,13 @@ class GPUDirectP2PBackend(DMABackend):
                     CUdeviceptr(dst),
                     CUdeviceptr(src),
                     ctypes.c_size_t(size),
-                    CUstream(None),
+                    cu_stream,
                 ),
                 f"{operation}: cuMemcpyAsync",
             )
 
             _check_cu(
-                _cuStreamSynchronize(CUstream(None)),
+                _cuStreamSynchronize(cu_stream),
                 f"{operation}: cuStreamSynchronize",
             )
 
