@@ -289,7 +289,9 @@ class GPUDirectP2PBackend(DMABackend):
         fd = os.open(bar_path, os.O_RDWR | os.O_SYNC)
         try:
             # Use libc mmap directly to get a raw void*, matching C code exactly.
-            result = _libc.mmap(
+            # Note: ctypes may return int or c_void_p depending on the system;
+            # normalise to c_void_p so we can use .value everywhere.
+            _raw = _libc.mmap(
                 None,
                 self._map_size,
                 mmap.PROT_READ | mmap.PROT_WRITE,
@@ -297,11 +299,12 @@ class GPUDirectP2PBackend(DMABackend):
                 fd,
                 0,  # offset
             )
-            if result.value == libc_MAP_FAILED:
+            raw_value = _raw if isinstance(_raw, int) else _raw.value
+            if raw_value == libc_MAP_FAILED:
                 err = ctypes.get_errno()
                 raise OSError(err, f"mmap of {bar_path} failed: "
                                    f"{os.strerror(err)}")
-            self._bar_ptr = result
+            self._bar_ptr = ctypes.c_void_p(raw_value)
 
             # cuCtxCreate already made the context current on this thread.
             # Use cuCtxSetCurrent (not PushCurrent) to mirror the C code.
