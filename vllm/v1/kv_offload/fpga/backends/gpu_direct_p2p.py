@@ -243,8 +243,8 @@ class GPUDirectP2PBackend(DMABackend):
             os.close(fd)
 
         # Get the address of the mmap'd BAR.
-        bar_byte = ctypes.c_ubyte.from_buffer(self._bar, 0)
-        self._bar_base = ctypes.addressof(bar_byte)
+        self._bar_byte = ctypes.c_ubyte.from_buffer(self._bar, 0)
+        self._bar_base = ctypes.addressof(self._bar_byte)
 
         # Ensure the context is current and register the BAR.
         _check_cu(
@@ -369,6 +369,9 @@ class GPUDirectP2PBackend(DMABackend):
 
         self._bar_base = 0
         self._d_bar = 0
+
+        # Release the ctypes buffer reference BEFORE closing the mmap.
+        self._bar_byte = None
 
         if self._bar is not None:
             try:
