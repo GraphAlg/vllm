@@ -306,21 +306,34 @@ class GPUDirectP2PBackend(DMABackend):
                                    f"{os.strerror(err)}")
             self._bar_ptr = ctypes.c_void_p(raw_value)
 
+            logger.info(
+                "BAR mmap: fd=%d bar_ptr=0x%x map_size=%d",
+                fd, self._bar_ptr.value, self._map_size,
+            )
+
             # cuCtxCreate already made the context current on this thread.
             # Use cuCtxSetCurrent (not PushCurrent) to mirror the C code.
             _check_cu(
                 _cuCtxSetCurrent(self._ctx),
                 "cuCtxSetCurrent",
             )
+            logger.info(
+                "cuCtxSetCurrent OK: ctx=0x%x", self._ctx.value,
+            )
 
+            flags = CU_MEMHOSTREGISTER_IOMEMORY | CU_MEMHOSTREGISTER_DEVICEMAP
+            logger.info(
+                "cuMemHostRegister: p=0x%x bytesize=%u flags=0x%x "
+                "(IOMEMORY=%d DEVICEMAP=%d)",
+                self._bar_ptr.value, self._map_size, flags,
+                bool(flags & CU_MEMHOSTREGISTER_IOMEMORY),
+                bool(flags & CU_MEMHOSTREGISTER_DEVICEMAP),
+            )
             _check_cu(
                 _cuda.cuMemHostRegister(
                     self._bar_ptr,
                     ctypes.c_size_t(self._map_size),
-                    ctypes.c_uint(
-                        CU_MEMHOSTREGISTER_IOMEMORY
-                        | CU_MEMHOSTREGISTER_DEVICEMAP,
-                    ),
+                    ctypes.c_uint(flags),
                 ),
                 "cuMemHostRegister",
             )
