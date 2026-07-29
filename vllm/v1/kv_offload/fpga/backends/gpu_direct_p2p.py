@@ -329,6 +329,17 @@ class GPUDirectP2PBackend(DMABackend):
                 bool(flags & CU_MEMHOSTREGISTER_IOMEMORY),
                 bool(flags & CU_MEMHOSTREGISTER_DEVICEMAP),
             )
+
+            # Dump the VMA containing the BAR mapping for debugging.
+            maps_path = "/proc/self/maps"
+            try:
+                with open(maps_path) as f:
+                    for line in f:
+                        if "7df06c000" in line or "resource" in line:
+                            logger.info("maps: %s", line.rstrip())
+            except Exception:
+                pass
+
             _check_cu(
                 _cuda.cuMemHostRegister(
                     self._bar_ptr,
