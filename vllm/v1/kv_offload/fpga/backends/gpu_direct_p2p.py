@@ -64,6 +64,7 @@ def _resolve_symbol(*names: str):
 # _v2 variant explicitly — CUDA 13+ has separate function pointers for
 # the legacy and v2 symbols, and the legacy variant rejects IOMEMORY.
 _cuCtxSetCurrent = _resolve_symbol("cuCtxSetCurrent")
+_cuCtxGetCurrent = _resolve_symbol("cuCtxGetCurrent")
 _cuMemHostRegister = _resolve_symbol(
     "cuMemHostRegister_v2",
     "cuMemHostRegister",
@@ -103,6 +104,9 @@ def _configure_cuda_api() -> None:
 
     _cuCtxSetCurrent.argtypes = [CUcontext]
     _cuCtxSetCurrent.restype = CUresult
+
+    _cuCtxGetCurrent.argtypes = [ctypes.POINTER(CUcontext)]
+    _cuCtxGetCurrent.restype = CUresult
 
     _cuMemHostRegister.argtypes = [
         ctypes.c_void_p,
@@ -257,36 +261,51 @@ class GPUDirectP2PBackend(DMABackend):
         self._bar_byte = ctypes.c_ubyte.from_buffer(self._bar, 0)
         self._bar_base = ctypes.addressof(self._bar_byte)
 
-        # Ensure the context is current and register the BAR.
+        # cuMemHostRegister / cuMemHostGetDevicePointer require a current
+        # context. Save the calling thread's current context and restore it
+        # afterwards: permanently switching the main thread's context to a
+        # different device desynchronizes torch's cached CUDA device state and
+        # breaks subsequent Triton/torch launches on this thread.
+        prev_ctx = CUcontext()
         _check_cu(
-            _cuCtxSetCurrent(self._ctx),
-            "cuCtxSetCurrent",
+            _cuCtxGetCurrent(ctypes.byref(prev_ctx)),
+            "cuCtxGetCurrent",
         )
+        try:
+            _check_cu(
+                _cuCtxSetCurrent(self._ctx),
+                "cuCtxSetCurrent",
+            )
 
-        _check_cu(
-            _cuMemHostRegister(
-                ctypes.c_void_p(self._bar_base),
-                ctypes.c_size_t(self._map_size),
-                ctypes.c_uint(
-                    CU_MEMHOSTREGISTER_IOMEMORY
-                    | CU_MEMHOSTREGISTER_DEVICEMAP,
+            _check_cu(
+                _cuMemHostRegister(
+                    ctypes.c_void_p(self._bar_base),
+                    ctypes.c_size_t(self._map_size),
+                    ctypes.c_uint(
+                        CU_MEMHOSTREGISTER_IOMEMORY
+                        | CU_MEMHOSTREGISTER_DEVICEMAP,
+                    ),
                 ),
-            ),
-            "cuMemHostRegister",
-        )
-        self._registered = True
+                "cuMemHostRegister",
+            )
+            self._registered = True
 
-        d_bar = CUdeviceptr()
-        _check_cu(
-            _cuMemHostGetDevicePointer(
-                ctypes.byref(d_bar),
-                ctypes.c_void_p(self._bar_base),
-                0,
-            ),
-            "cuMemHostGetDevicePointer",
-        )
+            d_bar = CUdeviceptr()
+            _check_cu(
+                _cuMemHostGetDevicePointer(
+                    ctypes.byref(d_bar),
+                    ctypes.c_void_p(self._bar_base),
+                    0,
+                ),
+                "cuMemHostGetDevicePointer",
+            )
 
-        self._d_bar = int(d_bar.value)
+            self._d_bar = int(d_bar.value)
+        finally:
+            _check_cu(
+                _cuCtxSetCurrent(prev_ctx),
+                "cuCtxSetCurrent (restore)",
+            )
         logger.info(
             "GPUDirectP2PBackend: %s  ctx=0x%x  bar=0x%x  d_bar=0x%x  size=%.1f GB",
             bar_path, self._ctx.value, self._bar_base,

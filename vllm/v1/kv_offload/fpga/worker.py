@@ -113,7 +113,23 @@ def _create_backend_and_allocator(
             block_size_bytes=total_bytes_per_block,
         )
 
-        device_id = int(os.environ.get("VLLM_FPGA_DEVICE_ID", "0"))
+        # The FPGA BAR must be registered in the same CUDA context the model
+        # runs on, otherwise cuMemcpyAsync between the model's KV tensors and
+        # the BAR's device pointer is a cross-context copy and fails. Default
+        # to torch's current device; VLLM_FPGA_DEVICE_ID is an explicit
+        # override (device ordinals follow CUDA_VISIBLE_DEVICES for both the
+        # runtime and driver APIs, so the spaces match).
+        model_device = torch.cuda.current_device()
+        device_id = int(
+            os.environ.get("VLLM_FPGA_DEVICE_ID", str(model_device))
+        )
+        if device_id != model_device:
+            logger.warning(
+                "VLLM_FPGA_DEVICE_ID=%d differs from the model's device "
+                "cuda:%d; D2D copies between the FPGA BAR and the model's "
+                "KV tensors require matching devices.",
+                device_id, model_device,
+            )
         backend = GPUDirectP2PBackend(
             fpga_allocator=allocator,
             device_id=device_id,
