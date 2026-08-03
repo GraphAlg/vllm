@@ -870,6 +870,15 @@ class OffloadingConnectorScheduler:
                     num_offloadable_tokens, req.num_prompt_tokens
                 )
 
+            logger.debug(
+                "offload-diag req=%s num_tokens=%d computed=%d scheduled=%d "
+                "offloadable=%d prompt_only=%s offloaded_block_size=%d",
+                req_id, req.num_tokens, req.num_computed_tokens,
+                num_scheduled_tokens, num_offloadable_tokens,
+                self.config.offload_prompt_only,
+                self.config.kv_group_configs[0].offloaded_block_size,
+            )
+
             # Filter out blocks skipped due to sliding window attention / SSM
             # or unreachable by the load path's alignment constraints.
             new_offload_keys: list[OffloadKey] = []
@@ -918,13 +927,22 @@ class OffloadingConnectorScheduler:
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
+                logger.debug(
+                    "offload-diag req=%s new_offload_keys EMPTY (no eligible blocks)",
+                    req_id,
+                )
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            logger.debug(
+                "offload-diag req=%s new_offload_keys=%d calling prepare_store",
+                req_id, len(new_offload_keys),
+            )
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
+                logger.debug("offload-diag req=%s prepare_store returned None", req_id)
                 logger.warning("Request %s: cannot store blocks", req_id)
                 continue
 
