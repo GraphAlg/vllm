@@ -37,6 +37,7 @@ OffloadingSpec (FPGAOffloadingSpec)     容量/块大小计算,注册于 Offload
 `GPUDirectP2PBackend` 完全依赖 `cuMemHostRegister(IOMEMORY)` + `cuMemcpyAsync` D→D。`IOMEMORY` 是 NVIDIA 的 niche 特性,对第三方 FPGA BAR 属非官方用法。实测:
 - 某些环境注册阶段直接失败(`CUDA_ERROR_*`);
 - 即使注册成功,**注册成功 ≠ aperture 是活的** —— `verify_kv_offload.py` 证明 store 通路完整执行,但 FPGA 读回全 `0xff`(`diag_dma_data.py` Phase C 纯 host 写读也是 `0xff`)。
+  - **硬件状态是动态的**:同一 `diag_dma_data.py`,07-31 全 FAIL(0xff,当时 CvP disabled / 无 bitstream / BAR 解码未启用),08-03 全 PASS(FPGA 已配置)。这正是 probe 必须**每次启动实时回环验证**、而不是缓存假设的原因。
 - 后端选择失败即启动崩溃,无回退。
 
 **P2. CUDA 上下文泄漏,破坏 torch/Triton 状态**
@@ -328,7 +329,7 @@ Worker.submit_load(fpga_blocks, gpu_blocks)
 ## 10. 风险与开放问题
 
 1. **OPAE/DFL 驱动可用性**:服务器上是否已装 Intel FPGA 驱动、设备节点是否暴露 —— 决定 `intel_fpga` 后端能否真正实现(需服务器确认,`ls /dev/dfl*` / `libopae` 存在性)。
-2. **FPGA bitstream 前置**:当前板卡 CvP disabled、无 bitstream,aperture 读 `0xff`。在 bitstream 就绪前,`gpu_direct_p2p` 的 probe 将正确返回 unavailable 并回退 —— 这是预期行为,不是 bug。
+2. **FPGA bitstream 前置**:08-03 已实测 aperture 存活(`diag_dma_data.py` 全 PASS),`gpu_direct_p2p` 通路当前可用。但硬件状态可能再次变化 —— probe 每次启动实时回环验证,状态变了就正确切换可用性,不依赖假设。
 3. **IOMEMORY 平台支持面**:`cuMemHostRegister(IOMEMORY)` 在部分 NVIDIA 驱动/GPU 上注册失败;该路径必须始终有回退,不能被当作默认。
 4. **带宽目标未量化**:重设计优先保证正确性(回环验证)与多厂商支持;带宽优化(块合并、多流、真异步)作为后续量化迭代。
 5. **BAR/BDF 自动发现**:首版可保留配置化 BDF/BAR(probe 时验证),sysfs 自动发现(vendor ID 匹配)作为增强。
