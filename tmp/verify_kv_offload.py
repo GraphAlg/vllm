@@ -98,9 +98,9 @@ def main() -> None:
     worker.wait({1})
     torch.cuda.current_stream().synchronize()
 
-    expected = (torch.arange(BLOCK_BYTES, dtype=torch.int64) % PATTERN_MOD).to(
-        torch.int8, device="cuda"
-    )
+    expected = (
+        torch.arange(BLOCK_BYTES, dtype=torch.int64, device="cuda") % PATTERN_MOD
+    ).to(torch.int8)
     load_match = torch.equal(gpu_tensor[0], expected)
     if load_match:
         print("LOAD VERIFY: PASS  (GPU block 0 restored from FPGA)")
