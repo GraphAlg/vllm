@@ -227,23 +227,71 @@ _BACKEND_PRIORITY = [
 
 ## 5. 数据流
 
-### Store(GPU → FPGA)
+KV cache offload 横跨**调度侧**(engine core)与 **worker 侧**(model runner),两侧各有一个 connector 实例,通过 `OffloadingConnectorMetadata` 传递 job。本节给出端到端生命周期;物理传输层(能力驱动分支)在 5.3。
+
+### 5.1 调度侧:何时卸载(每步执行)
+
+engine 每步调度调用 `connector.build_connector_meta(scheduler_output)`([sched/scheduler.py:1134](vllm/v1/core/sched/scheduler.py#L1134)),在 `OffloadingConnectorScheduler` 内([offloading/scheduler.py](vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py)):
+
+```
+_update_req_states()     # 更新每个请求的 offload keys(block_hash + group_idx 序列)
+_build_load_jobs()       # 前缀命中 FPGA 但不在 GPU 的块 → load job
+_build_store_jobs()      # 可卸载块 → store job
+```
+
+**Store 触发条件**([scheduler.py:844](vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py#L844) `_build_store_jobs`):
+
+```
+num_offloadable_tokens = min(已计算token数, 请求token数)
+                          # offload_prompt_only=True(默认)时再钳制到 prompt tokens
+num_blocks = num_offloadable_tokens // offloaded_block_size
+if num_blocks <= next_stored_block_idx: 跳过      # 不足一块 → 不触发
+manager.prepare_store(keys) → 分配 FPGA 块,LRU/ARC 逐出 → (store_spec, evicted_keys)
+```
+
+- store 按**已计算 token 渐进触发**,不依赖 GPU eviction
+- 短 prompt(不足一块)不触发 —— 实测中"无 Store"的原因;长 prompt 实测 `Store: 125 GPU blocks → FPGA`
+- `offload_prompt_only=False` 时 decode 阶段的块也参与卸载
+
+**Load 触发条件**(`_build_load_jobs`):请求的哈希前缀在 manager `lookup()` 命中(`HIT`)且该块不在 GPU cache → 生成 load job。
+
+### 5.2 worker 侧:job → 实际传输(每步开头)
+
+metadata 送到 worker 侧,`OffloadingConnectorWorker` 提交([offloading/worker.py:281](vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py#L281)):
+
+```
+start_kv_transfers(metadata)
+  ├─ 提交积压 store:worker.submit_store(job_id, gpu_blocks, fpga_blocks)
+  └─ 每个 load job: worker.submit_load(job_id, fpga_blocks, gpu_blocks)
+
+get_finished()
+  ├─ prepare_store_kv(metadata)  # 新 store job 推迟到下一步开头提交,避免延迟 token 生成
+  └─ worker.get_finished()       # 收集完成的 TransferResult → 调度侧 complete_store/complete_load
+```
+
+设计要点:**store 故意推迟到下一步开头**([worker.py:294](vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py#L294) 注释),让 offload 不挡当步的 token 生成。
+
+### 5.3 物理传输层(能力驱动,本设计的核心)
+
+`FPGAOffloadingWorker.submit_store/submit_load` → `BlockTransferEngine.launch_copy` → 后台线程 `_copy_loop` → `_do_store/_do_load`,按 `BackendCapabilities.needs_bounce` 分支:
+
+**Store(GPU → FPGA)**
 
 ```
 Worker.submit_store(gpu_blocks, fpga_blocks)
   └─ 记录 store_compute_done(event: GPU compute 完成)
       └─ Engine.launch_copy(is_store=True, wait_event=store_compute_done)
           └─ 后台线程 _do_store:
-              needs_bounce=False:
+              needs_bounce=False(直连):
                 gpu_src = gpu_tensor[bid].contiguous()
                 backend.write(gpu_src.data_ptr(), fpga_addr, size, stream=store_stream)
-              needs_bounce=True:
+              needs_bounce=True(两跳):
                 bounce[:size].copy_(gpu_src, non_blocking=True)   # on store_stream
                 backend.write(bounce.data_ptr(), fpga_addr, size)
               └─ record event on store_stream → 完成信号
 ```
 
-### Load(FPGA → GPU)
+**Load(FPGA → GPU)**
 
 ```
 Worker.submit_load(fpga_blocks, gpu_blocks)
@@ -255,6 +303,17 @@ Worker.submit_load(fpga_blocks, gpu_blocks)
             backend.read(fpga_addr, bounce.data_ptr(), size)
             gpu_tensor[bid].copy_(bounce[:size], non_blocking=True)  # on load_stream
           └─ record event on load_stream → 完成信号
+```
+
+### 5.4 生命周期中的 block 状态
+
+```
+GPU 计算完成 → 哈希入 GPU prefix cache(cache_full_blocks)
+  → _build_store_jobs 判定可卸载 → prepare_store(FPGA 分配块,块受保护)
+  → submit_store → DMA 写 FPGA → complete_store(FPGA 中可 lookup=HIT)
+  → 请求结束/逐出 → 新请求前缀命中:
+        GPU 有 → 命中 GPU 前缀缓存,不 Load
+        GPU 无 + FPGA HIT → prepare_load → submit_load → DMA 读回 → complete_load
 ```
 
 ---
