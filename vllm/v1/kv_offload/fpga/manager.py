@@ -14,8 +14,10 @@ from typing import Literal
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
+    _StatsKey,
 )
 from vllm.v1.kv_offload.base import OffloadingEvent, OffloadingManager
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.fpga.common import (
     FPGALoadStoreSpec,
@@ -96,6 +98,18 @@ class FPGAOffloadingManager(OffloadingManager):
         if stats is not None:
             # Relabel medium-specific metrics.
             stats.medium = self.medium
+            # The delegated CPU manager records its cache-usage gauge under
+            # the CPU-named key, but FPGAOffloadingSpec declares the
+            # FPGA-named key. Remap it so observe() finds the definition.
+            data = stats.data.get(_StatsKey.DATA)
+            if data is not None and CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC in data:
+                types = stats.data.get(_StatsKey.TYPES, {})
+                data[FPGAOffloadingMetrics.FPGA_CACHE_USAGE_PERC] = data.pop(
+                    CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC
+                )
+                types[FPGAOffloadingMetrics.FPGA_CACHE_USAGE_PERC] = types.pop(
+                    CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC
+                )
         return stats
 
     def shutdown(self) -> None:
